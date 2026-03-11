@@ -1,0 +1,81 @@
+name: 'Dokploy Trigger and Poll'
+description: 'Triggers a Dokploy deployment and monitors the specific record by title'
+inputs:
+  dokploy-url:
+    description: 'The base URL of your Dokploy instance'
+    required: true
+  dokploy-api-key:
+    description: 'API Key for Dokploy'
+    required: true
+  dokploy-app-id:
+    description: 'The Application ID to deploy'
+    required: true
+  max-wait-minutes:
+    description: 'Maximum time to wait for deployment in minutes'
+    required: false
+    default: '10'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Trigger and Poll Dokploy
+      shell: bash
+      run: |
+        SHORT_SHA=$(git rev-parse --short HEAD)
+        COMMIT_MSG=$(git log -1 --pretty=%s)
+        
+        # Unique identifier for this specific run
+        DEPLOY_TITLE="CD build #$GITHUB_RUN_NUMBER ($SHORT_SHA)"
+        
+        # Calculate max retries based on 10s intervals
+        MAX_RETRIES=$((${{ inputs.max-wait-minutes }} * 6))
+
+        echo "Initiating deployment for App ID: ${{ inputs.dokploy-app-id }}..."
+        echo "Tracking ID: $DEPLOY_TITLE"
+
+        curl -s -X 'POST' '${{ inputs.dokploy-url }}/api/application.deploy' \
+          -H 'x-api-key: ${{ inputs.dokploy-api-key }}' \
+          -H 'Content-Type: application/json' \
+          -d "{
+                \"applicationId\": \"${{ inputs.dokploy-app-id }}\",
+                \"title\": \"$DEPLOY_TITLE\",
+                \"description\": \"Commit: $COMMIT_MSG\"
+              }"
+
+        echo "Deployment triggered. Monitoring for up to ${{ inputs.max-wait-minutes }} minutes..."
+        sleep 10 
+
+        COUNT=0
+        while [ $COUNT -lt $MAX_RETRIES ]; do
+          RESPONSE=$(curl -s -X 'GET' "${{ inputs.dokploy-url }}/api/application.one?applicationId=${{ inputs.dokploy-app-id }}" \
+            -H "x-api-key: ${{ inputs.dokploy-api-key }}")
+
+          # Filter deployments array for the entry matching our unique title
+          DEPLOYMENT_ENTRY=$(echo "$RESPONSE" | jq -r --arg TITLE "$DEPLOY_TITLE" '.deployments[] | select(.title == $TITLE)')
+          
+          STATUS=$(echo "$DEPLOYMENT_ENTRY" | jq -r '.status // "pending"')
+          ERROR_MSG=$(echo "$DEPLOYMENT_ENTRY" | jq -r '.errorMessage // ""')
+
+          if [ -z "$DEPLOYMENT_ENTRY" ]; then
+            echo "Status: Waiting for record to appear..."
+          else
+            echo "Current Status: $STATUS (Attempt $((COUNT + 1))/$MAX_RETRIES)"
+          fi
+
+          if [ "$STATUS" == "done" ]; then
+            echo "Deployment successful for $SHORT_SHA!"
+            exit 0
+          elif [ "$STATUS" == "error" ]; then
+            echo "Deployment failed for $SHORT_SHA: $ERROR_MSG"
+            exit 1
+          elif [ "$STATUS" == "cancelled" ]; then
+            echo "Deployment manually stopped in Dokploy."
+            exit 1
+          fi
+
+          COUNT=$((COUNT + 1))
+          sleep 10
+        done
+
+        echo "Deployment timed out after ${{ inputs.max-wait-minutes }} minutes."
+        exit 1
