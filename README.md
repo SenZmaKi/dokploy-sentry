@@ -11,7 +11,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4 # Required to extract commit metadata
       - name: Deploy to Dokploy
         uses: SenZmaKi/dokploy-sentry@main
         with:
@@ -19,6 +19,8 @@ jobs:
           dokploy-api-key: ${{ secrets.DOKPLOY_API_KEY }}
           dokploy-app-id: ${{ secrets.DOKPLOY_APP_ID }}
 ```
+
+> **Important Note:** This action requires the `.git` directory to generate deployment titles and descriptions. You **must** include the `actions/checkout` step before calling this action.
 
 ## Inputs
 
