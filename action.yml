@@ -1,19 +1,19 @@
-name: 'Dokploy Trigger and Poll'
-description: 'Triggers a Dokploy deployment and monitors the specific record by title'
+name: "Dokploy Trigger and Poll"
+description: "Triggers a Dokploy deployment and monitors the specific record by title"
 inputs:
   dokploy-url:
-    description: 'The base URL of your Dokploy instance'
+    description: "The base URL of your Dokploy instance"
     required: true
   dokploy-api-key:
-    description: 'API Key for Dokploy'
+    description: "API Key for Dokploy"
     required: true
   dokploy-app-id:
-    description: 'The Application ID to deploy'
+    description: "The Application ID to deploy"
     required: true
   max-wait-minutes:
-    description: 'Maximum time to wait for deployment in minutes'
+    description: "Maximum time to wait for deployment in minutes"
     required: false
-    default: '10'
+    default: "10"
 
 runs:
   using: "composite"
@@ -23,10 +23,10 @@ runs:
       run: |
         SHORT_SHA=$(git rev-parse --short HEAD)
         COMMIT_MSG=$(git log -1 --pretty=%s)
-        
+
         # Unique identifier for this specific run
         DEPLOY_TITLE="CD build #$GITHUB_RUN_NUMBER ($SHORT_SHA)"
-        
+
         # Calculate max retries based on 10s intervals
         MAX_RETRIES=$((${{ inputs.max-wait-minutes }} * 6))
 

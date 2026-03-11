@@ -4,7 +4,7 @@ A GitHub Action to trigger a Dokploy deployment and poll for the result.
 
 ## Usage
 
-Add this to your `.github/workflows/deploy.yml`:
+Add this to your deployment workflow:
 
 ```yaml
 jobs:
@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Deploy to Dokploy
-        uses: your-username/dokploy-trigger-and-poll@v1
+        uses: SenZmaKi/dokploy-sentry@main
         with:
           dokploy-url: ${{ secrets.DOKPLOY_URL }}
           dokploy-api-key: ${{ secrets.DOKPLOY_API_KEY }}
@@ -22,9 +22,9 @@ jobs:
 
 ## Inputs
 
-| Input | Description | Required | Default |
-|-------|-------------|----------|---------|
-| `dokploy-url` | The base URL of your Dokploy instance | Yes | |
-| `dokploy-api-key` | API Key for Dokploy | Yes | |
-| `dokploy-app-id` | The Application ID to deploy | Yes | |
-| `max-wait-minutes` | Maximum time to wait for deployment in minutes | No | `10` |
+| Input              | Description                                    | Required | Default |
+| ------------------ | ---------------------------------------------- | -------- | ------- |
+| `dokploy-url`      | The base URL of your Dokploy instance          | Yes      |         |
+| `dokploy-api-key`  | API Key for Dokploy                            | Yes      |         |
+| `dokploy-app-id`   | The Application ID to deploy                   | Yes      |         |
+| `max-wait-minutes` | Maximum time to wait for deployment in minutes | No       | `10`    |
