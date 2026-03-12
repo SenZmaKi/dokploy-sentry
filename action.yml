@@ -1,5 +1,5 @@
 name: "Dokploy Trigger and Poll"
-description: "Triggers a Dokploy deployment and monitors the specific record by title"
+description: "Triggers a Dokploy deployment and monitors the specific record by title, handling re-runs accurately"
 inputs:
   dokploy-url:
     description: "The base URL of your Dokploy instance"
@@ -21,11 +21,14 @@ runs:
     - name: Trigger and Poll Dokploy
       shell: bash
       run: |
+        # Identify the current commit and message
         SHORT_SHA=$(git rev-parse --short HEAD)
         COMMIT_MSG=$(git log -1 --pretty=%s)
 
-        # Unique identifier for this specific run
-        DEPLOY_TITLE="CD build #$GITHUB_RUN_NUMBER ($SHORT_SHA)"
+        # Use GITHUB_RUN_ATTEMPT to ensure re-runs get a unique title in Dokploy
+        # This prevents the script from reading the status of a previous run
+        RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
+        DEPLOY_TITLE="Build #$GITHUB_RUN_NUMBER.$RUN_ATTEMPT ($SHORT_SHA)"
 
         # Calculate max retries based on 10s intervals
         MAX_RETRIES=$((${{ inputs.max-wait-minutes }} * 6))
@@ -33,44 +36,49 @@ runs:
         echo "Initiating deployment for App ID: ${{ inputs.dokploy-app-id }}..."
         echo "Tracking ID: $DEPLOY_TITLE"
 
+        # Triggering the Dokploy API
         curl -s -X 'POST' '${{ inputs.dokploy-url }}/api/application.deploy' \
           -H 'x-api-key: ${{ inputs.dokploy-api-key }}' \
           -H 'Content-Type: application/json' \
           -d "{
                 \"applicationId\": \"${{ inputs.dokploy-app-id }}\",
                 \"title\": \"$DEPLOY_TITLE\",
-                \"description\": \"Commit: $COMMIT_MSG\"
+                \"description\": \"Attempt $RUN_ATTEMPT - Commit: $COMMIT_MSG\"
               }"
 
         echo "Deployment triggered. Monitoring for up to ${{ inputs.max-wait-minutes }} minutes..."
+
+        # Initial wait for the system to register the request
         sleep 10 
 
         COUNT=0
         while [ $COUNT -lt $MAX_RETRIES ]; do
+          # Fetch application details including deployment history
           RESPONSE=$(curl -s -X 'GET' "${{ inputs.dokploy-url }}/api/application.one?applicationId=${{ inputs.dokploy-app-id }}" \
             -H "x-api-key: ${{ inputs.dokploy-api-key }}")
 
-          # Filter deployments array for the entry matching our unique title
+          # Isolate the specific deployment entry matching our unique title
           DEPLOYMENT_ENTRY=$(echo "$RESPONSE" | jq -r --arg TITLE "$DEPLOY_TITLE" '.deployments[] | select(.title == $TITLE)')
           
-          STATUS=$(echo "$DEPLOYMENT_ENTRY" | jq -r '.status // "pending"')
-          ERROR_MSG=$(echo "$DEPLOYMENT_ENTRY" | jq -r '.errorMessage // ""')
+          # Extract status and error message if applicable
+          STATUS=$(echo "$DEPLOYMENT_ENTRY" | jq -r '.status // empty')
 
-          if [ -z "$DEPLOYMENT_ENTRY" ]; then
-            echo "Status: Waiting for record to appear..."
+          if [ -z "$STATUS" ]; then
+            echo "Status: Waiting for record '$DEPLOY_TITLE' to appear in Dokploy..."
           else
             echo "Current Status: $STATUS (Attempt $((COUNT + 1))/$MAX_RETRIES)"
-          fi
-
-          if [ "$STATUS" == "done" ]; then
-            echo "Deployment successful for $SHORT_SHA!"
-            exit 0
-          elif [ "$STATUS" == "error" ]; then
-            echo "Deployment failed for $SHORT_SHA: $ERROR_MSG"
-            exit 1
-          elif [ "$STATUS" == "cancelled" ]; then
-            echo "Deployment manually stopped in Dokploy."
-            exit 1
+            
+            if [ "$STATUS" == "done" ]; then
+              echo "Deployment successful for $SHORT_SHA (Run $RUN_ATTEMPT)!"
+              exit 0
+            elif [ "$STATUS" == "error" ]; then
+              ERROR_MSG=$(echo "$DEPLOYMENT_ENTRY" | jq -r '.errorMessage // "Unknown error encountered"')
+              echo "Deployment failed for $SHORT_SHA: $ERROR_MSG"
+              exit 1
+            elif [ "$STATUS" == "cancelled" ]; then
+              echo "Deployment was manually cancelled in Dokploy."
+              exit 1
+            fi
           fi
 
           COUNT=$((COUNT + 1))
