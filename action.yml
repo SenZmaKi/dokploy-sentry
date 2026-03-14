@@ -13,7 +13,7 @@ inputs:
   max-wait-minutes:
     description: "Maximum time to wait for deployment in minutes"
     required: false
-    default: "10"
+    default: "5"
 
 runs:
   using: "composite"

@@ -29,4 +29,4 @@ jobs:
 | `dokploy-url`      | The base URL of your Dokploy instance          | Yes      |         |
 | `dokploy-api-key`  | API Key for Dokploy                            | Yes      |         |
 | `dokploy-app-id`   | The Application ID to deploy                   | Yes      |         |
-| `max-wait-minutes` | Maximum time to wait for deployment in minutes | No       | `10`    |
+| `max-wait-minutes` | Maximum time to wait for deployment in minutes | No       | `5`    |
