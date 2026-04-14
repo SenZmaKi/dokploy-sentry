@@ -21,69 +21,221 @@ runs:
     - name: Trigger and Poll Dokploy
       shell: bash
       run: |
-        # Identify the current commit and message
+        set -euo pipefail
+
+        require_non_empty() {
+          local name="$1"
+          local value="$2"
+
+          if [ -z "$value" ]; then
+            echo "::error::Missing required input '$name'. Make sure the corresponding workflow input or secret is set."
+            exit 1
+          fi
+        }
+
+        extract_error_message() {
+          local body="$1"
+          local fallback="$2"
+          local extracted=""
+
+          if printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+            extracted=$(printf '%s' "$body" | jq -r '
+              [
+                .message?,
+                .error?,
+                .errorMessage?,
+                .details?,
+                .errors?[0]?.message?,
+                .data?.message?
+              ]
+              | map(select(type == "string" and length > 0))
+              | .[0] // empty
+            ' 2>/dev/null || true)
+          fi
+
+          if [ -n "$extracted" ]; then
+            printf '%s\n' "$extracted"
+            return
+          fi
+
+          if [ -n "$body" ]; then
+            printf '%s\n' "$body" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+            return
+          fi
+
+          printf '%s\n' "$fallback"
+        }
+
+        api_request() {
+          local method="$1"
+          local path="$2"
+          local payload="$3"
+          local context="$4"
+          local response_file
+          local curl_error_file
+          local http_status
+          local curl_exit
+          local body
+          local error_message
+
+          response_file=$(mktemp)
+          curl_error_file=$(mktemp)
+
+          set +e
+          if [ -n "$payload" ]; then
+            http_status=$(
+              curl --silent --show-error --location \
+                --request "$method" \
+                --url "${DOKPLOY_URL}${path}" \
+                --header "x-api-key: $DOKPLOY_API_KEY" \
+                --header "Content-Type: application/json" \
+                --data "$payload" \
+                --output "$response_file" \
+                --write-out "%{http_code}" \
+                2>"$curl_error_file"
+            )
+          else
+            http_status=$(
+              curl --silent --show-error --location \
+                --request "$method" \
+                --url "${DOKPLOY_URL}${path}" \
+                --header "x-api-key: $DOKPLOY_API_KEY" \
+                --output "$response_file" \
+                --write-out "%{http_code}" \
+                2>"$curl_error_file"
+            )
+          fi
+          curl_exit=$?
+          set -e
+
+          body=$(cat "$response_file")
+          error_message=$(cat "$curl_error_file")
+          rm -f "$response_file" "$curl_error_file"
+
+          if [ "$curl_exit" -ne 0 ]; then
+            if [ -z "$error_message" ]; then
+              error_message=$(extract_error_message "$body" "Unable to reach Dokploy.")
+            fi
+
+            echo "::error::$context failed before Dokploy accepted the request: $error_message"
+            exit 1
+          fi
+
+          if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
+            error_message=$(extract_error_message "$body" "Dokploy returned HTTP $http_status.")
+            echo "::error::$context failed with HTTP $http_status: $error_message"
+            exit 1
+          fi
+
+          printf '%s' "$body"
+        }
+
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "::error::This action requires jq, but it is not available on the runner."
+          exit 1
+        fi
+
+        if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          echo "::error::Git metadata is unavailable. Add actions/checkout before this action so commit details can be read."
+          exit 1
+        fi
+
+        DOKPLOY_URL="${{ inputs.dokploy-url }}"
+        DOKPLOY_API_KEY="${{ inputs.dokploy-api-key }}"
+        DOKPLOY_APP_ID="${{ inputs.dokploy-app-id }}"
+        MAX_WAIT_MINUTES="${{ inputs.max-wait-minutes }}"
+
+        require_non_empty "dokploy-url" "$DOKPLOY_URL"
+        require_non_empty "dokploy-api-key" "$DOKPLOY_API_KEY"
+        require_non_empty "dokploy-app-id" "$DOKPLOY_APP_ID"
+        require_non_empty "max-wait-minutes" "$MAX_WAIT_MINUTES"
+
+        case "$MAX_WAIT_MINUTES" in
+          ''|*[!0-9]*)
+            echo "::error::Input 'max-wait-minutes' must be a positive integer."
+            exit 1
+            ;;
+        esac
+
+        if [ "$MAX_WAIT_MINUTES" -lt 1 ]; then
+          echo "::error::Input 'max-wait-minutes' must be at least 1."
+          exit 1
+        fi
+
+        DOKPLOY_URL="${DOKPLOY_URL%/}"
+
         SHORT_SHA=$(git rev-parse --short HEAD)
         COMMIT_MSG=$(git log -1 --pretty=%s)
-
-        # Use GITHUB_RUN_ATTEMPT to ensure re-runs get a unique title in Dokploy
-        # This prevents the script from reading the status of a previous run
         RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
-        DEPLOY_TITLE="Build #$GITHUB_RUN_NUMBER.$RUN_ATTEMPT ($SHORT_SHA)"
+        BUILD_NUMBER="${GITHUB_RUN_NUMBER:-0}.${RUN_ATTEMPT}"
+        DEPLOY_TITLE="${COMMIT_MSG} (${SHORT_SHA})"
+        DEPLOY_DESCRIPTION="Build #${BUILD_NUMBER} | Commit: ${SHORT_SHA}"
 
-        # Calculate max retries based on 10s intervals
-        MAX_RETRIES=$((${{ inputs.max-wait-minutes }} * 6))
+        MAX_RETRIES=$((MAX_WAIT_MINUTES * 6))
 
-        echo "Initiating deployment for App ID: ${{ inputs.dokploy-app-id }}..."
-        echo "Tracking ID: $DEPLOY_TITLE"
+        echo "::notice::Triggering Dokploy deployment for app '${DOKPLOY_APP_ID}'."
+        echo "Deployment title: ${DEPLOY_TITLE}"
+        echo "Deployment description: ${DEPLOY_DESCRIPTION}"
 
-        # Triggering the Dokploy API
-        curl -s -X 'POST' '${{ inputs.dokploy-url }}/api/application.deploy' \
-          -H 'x-api-key: ${{ inputs.dokploy-api-key }}' \
-          -H 'Content-Type: application/json' \
-          -d "{
-                \"applicationId\": \"${{ inputs.dokploy-app-id }}\",
-                \"title\": \"$DEPLOY_TITLE\",
-                \"description\": \"Attempt $RUN_ATTEMPT - Commit: $COMMIT_MSG\"
-              }"
+        TRIGGER_PAYLOAD=$(
+          jq -cn \
+            --arg applicationId "$DOKPLOY_APP_ID" \
+            --arg title "$DEPLOY_TITLE" \
+            --arg description "$DEPLOY_DESCRIPTION" \
+            '{
+              applicationId: $applicationId,
+              title: $title,
+              description: $description
+            }'
+        )
 
-        echo "Deployment triggered. Monitoring for up to ${{ inputs.max-wait-minutes }} minutes..."
+        api_request "POST" "/api/application.deploy" "$TRIGGER_PAYLOAD" "Triggering deployment" >/dev/null
 
-        # Initial wait for the system to register the request
-        sleep 10 
+        echo "Dokploy accepted the deployment request. Monitoring for up to ${MAX_WAIT_MINUTES} minutes..."
+        sleep 10
 
         COUNT=0
-        while [ $COUNT -lt $MAX_RETRIES ]; do
-          # Fetch application details including deployment history
-          RESPONSE=$(curl -s -X 'GET' "${{ inputs.dokploy-url }}/api/application.one?applicationId=${{ inputs.dokploy-app-id }}" \
-            -H "x-api-key: ${{ inputs.dokploy-api-key }}")
+        while [ "$COUNT" -lt "$MAX_RETRIES" ]; do
+          RESPONSE=$(api_request "GET" "/api/application.one?applicationId=${DOKPLOY_APP_ID}" "" "Fetching application state")
 
-          # Isolate the specific deployment entry matching our unique title
-          DEPLOYMENT_ENTRY=$(echo "$RESPONSE" | jq -r --arg TITLE "$DEPLOY_TITLE" '.deployments[] | select(.title == $TITLE)')
-          
-          # Extract status and error message if applicable
-          STATUS=$(echo "$DEPLOYMENT_ENTRY" | jq -r '.status // empty')
+          DEPLOYMENT_ENTRY=$(
+            printf '%s' "$RESPONSE" | jq -c \
+              --arg TITLE "$DEPLOY_TITLE" \
+              --arg DESCRIPTION "$DEPLOY_DESCRIPTION" \
+              '
+                (.deployments // [])
+                | map(select(.title == $TITLE and ((.description // "") == $DESCRIPTION)))
+                | first // empty
+              '
+          )
 
-          if [ -z "$STATUS" ]; then
-            echo "Status: Waiting for record '$DEPLOY_TITLE' to appear in Dokploy..."
+          if [ -z "$DEPLOYMENT_ENTRY" ]; then
+            echo "Status: waiting for Dokploy to create '${DEPLOY_TITLE}' with '${DEPLOY_DESCRIPTION}'."
           else
-            echo "Current Status: $STATUS (Attempt $((COUNT + 1))/$MAX_RETRIES)"
-            
-            if [ "$STATUS" == "done" ]; then
-              echo "Deployment successful for $SHORT_SHA (Run $RUN_ATTEMPT)!"
-              exit 0
-            elif [ "$STATUS" == "error" ]; then
-              ERROR_MSG=$(echo "$DEPLOYMENT_ENTRY" | jq -r '.errorMessage // "Unknown error encountered"')
-              echo "Deployment failed for $SHORT_SHA: $ERROR_MSG"
-              exit 1
-            elif [ "$STATUS" == "cancelled" ]; then
-              echo "Deployment was manually cancelled in Dokploy."
-              exit 1
-            fi
+            STATUS=$(printf '%s' "$DEPLOYMENT_ENTRY" | jq -r '.status // empty')
+            echo "Current status: ${STATUS:-unknown} ($((COUNT + 1))/${MAX_RETRIES})"
+
+            case "$STATUS" in
+              done)
+                echo "::notice::Deployment completed successfully for ${SHORT_SHA}."
+                exit 0
+                ;;
+              error)
+                ERROR_MSG=$(extract_error_message "$DEPLOYMENT_ENTRY" "Dokploy marked the deployment as failed.")
+                echo "::error::Deployment failed for ${SHORT_SHA}: $ERROR_MSG"
+                exit 1
+                ;;
+              cancelled)
+                ERROR_MSG=$(extract_error_message "$DEPLOYMENT_ENTRY" "The deployment was cancelled in Dokploy.")
+                echo "::error::Deployment cancelled for ${SHORT_SHA}: $ERROR_MSG"
+                exit 1
+                ;;
+            esac
           fi
 
           COUNT=$((COUNT + 1))
           sleep 10
         done
 
-        echo "Deployment timed out after ${{ inputs.max-wait-minutes }} minutes."
+        echo "::error::Deployment timed out after ${MAX_WAIT_MINUTES} minutes while waiting for '${DEPLOY_TITLE}'."
         exit 1
