@@ -34,13 +34,9 @@ jobs:
 
 > **Note:** `dokploy-app-id` and `dokploy-compose-id` are mutually exclusive — provide exactly one.
 
-### Application deployments
+### Deployment labelling
 
 Deployment records are labeled using the latest commit message as the Dokploy title, with the short SHA in parentheses. The description includes the GitHub build number and short SHA. The action matches this exact title and description when polling, so re-runs on the same commit are handled correctly.
-
-### Compose deployments
-
-The Dokploy compose API does not accept a custom title or description. Instead, the action records a timestamp immediately before triggering and matches the first deployment record created at or after that time when polling.
 
 ## Inputs
 
