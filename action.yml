@@ -1,5 +1,5 @@
 name: "Dokploy Trigger and Poll"
-description: "Triggers a Dokploy deployment and monitors the specific record by title, handling re-runs accurately"
+description: "Triggers a Dokploy deployment for an application or compose service and monitors it until completion"
 inputs:
   dokploy-url:
     description: "The base URL of your Dokploy instance"
@@ -8,8 +8,13 @@ inputs:
     description: "API Key for Dokploy"
     required: true
   dokploy-app-id:
-    description: "The Application ID to deploy"
-    required: true
+    description: "The Application ID to deploy (mutually exclusive with dokploy-compose-id)"
+    required: false
+    default: ""
+  dokploy-compose-id:
+    description: "The Compose ID to deploy (mutually exclusive with dokploy-app-id)"
+    required: false
+    default: ""
   max-wait-minutes:
     description: "Maximum time to wait for deployment in minutes"
     required: false
@@ -23,16 +28,21 @@ runs:
       run: |
         set -euo pipefail
 
+        # ──────────────────────────────────────────────
+        # Helpers
+        # ──────────────────────────────────────────────
+
         require_non_empty() {
           local name="$1"
           local value="$2"
-
           if [ -z "$value" ]; then
             echo "::error::Missing required input '$name'. Make sure the corresponding workflow input or secret is set."
             exit 1
           fi
         }
 
+        # Attempt to pull a human-readable error string out of a JSON body.
+        # Falls back to the raw body, then to a supplied default string.
         extract_error_message() {
           local body="$1"
           local fallback="$2"
@@ -66,17 +76,20 @@ runs:
           printf '%s\n' "$fallback"
         }
 
+        # Perform a curl request and print the response body to stdout.
+        # On network or HTTP error: print a clear, structured error block and exit 1.
         api_request() {
           local method="$1"
           local path="$2"
-          local payload="$3"
+          local payload="$3"   # pass "" for requests with no body
           local context="$4"
           local response_file
           local curl_error_file
           local http_status
           local curl_exit
           local body
-          local error_message
+          local curl_err_msg
+          local api_err_msg
 
           response_file=$(mktemp)
           curl_error_file=$(mktemp)
@@ -109,26 +122,36 @@ runs:
           set -e
 
           body=$(cat "$response_file")
-          error_message=$(cat "$curl_error_file")
+          curl_err_msg=$(cat "$curl_error_file")
           rm -f "$response_file" "$curl_error_file"
 
+          # ── Network / curl-level failure ──────────────────────────────────────
           if [ "$curl_exit" -ne 0 ]; then
-            if [ -z "$error_message" ]; then
-              error_message=$(extract_error_message "$body" "Unable to reach Dokploy.")
+            if [ -z "$curl_err_msg" ]; then
+              curl_err_msg=$(extract_error_message "$body" "curl exited with code $curl_exit.")
             fi
-
-            echo "::error::$context failed before Dokploy accepted the request: $error_message"
+            echo "::error::❌ $context — network error (curl exit $curl_exit)"
+            echo "::error::   Detail: $curl_err_msg"
             exit 1
           fi
 
+          # ── HTTP error response ───────────────────────────────────────────────
           if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
-            error_message=$(extract_error_message "$body" "Dokploy returned HTTP $http_status.")
-            echo "::error::$context failed with HTTP $http_status: $error_message"
+            api_err_msg=$(extract_error_message "$body" "No additional detail returned.")
+            echo "::error::❌ $context — HTTP $http_status"
+            echo "::error::   URL   : ${DOKPLOY_URL}${path}"
+            echo "::error::   Status: $http_status"
+            echo "::error::   Body  : $body"
+            echo "::error::   Detail: $api_err_msg"
             exit 1
           fi
 
           printf '%s' "$body"
         }
+
+        # ──────────────────────────────────────────────
+        # Pre-flight checks
+        # ──────────────────────────────────────────────
 
         if ! command -v jq >/dev/null 2>&1; then
           echo "::error::This action requires jq, but it is not available on the runner."
@@ -143,12 +166,23 @@ runs:
         DOKPLOY_URL="${{ inputs.dokploy-url }}"
         DOKPLOY_API_KEY="${{ inputs.dokploy-api-key }}"
         DOKPLOY_APP_ID="${{ inputs.dokploy-app-id }}"
+        DOKPLOY_COMPOSE_ID="${{ inputs.dokploy-compose-id }}"
         MAX_WAIT_MINUTES="${{ inputs.max-wait-minutes }}"
 
-        require_non_empty "dokploy-url" "$DOKPLOY_URL"
+        require_non_empty "dokploy-url"     "$DOKPLOY_URL"
         require_non_empty "dokploy-api-key" "$DOKPLOY_API_KEY"
-        require_non_empty "dokploy-app-id" "$DOKPLOY_APP_ID"
         require_non_empty "max-wait-minutes" "$MAX_WAIT_MINUTES"
+
+        # Exactly one of app-id / compose-id must be supplied
+        if [ -z "$DOKPLOY_APP_ID" ] && [ -z "$DOKPLOY_COMPOSE_ID" ]; then
+          echo "::error::You must provide exactly one of 'dokploy-app-id' or 'dokploy-compose-id'."
+          exit 1
+        fi
+
+        if [ -n "$DOKPLOY_APP_ID" ] && [ -n "$DOKPLOY_COMPOSE_ID" ]; then
+          echo "::error::'dokploy-app-id' and 'dokploy-compose-id' are mutually exclusive — provide only one."
+          exit 1
+        fi
 
         case "$MAX_WAIT_MINUTES" in
           ''|*[!0-9]*)
@@ -164,70 +198,137 @@ runs:
 
         DOKPLOY_URL="${DOKPLOY_URL%/}"
 
+        # ──────────────────────────────────────────────
+        # Deployment metadata
+        # ──────────────────────────────────────────────
+
         SHORT_SHA=$(git rev-parse --short HEAD)
         COMMIT_MSG=$(git log -1 --pretty=%s)
         RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
         BUILD_NUMBER="${GITHUB_RUN_NUMBER:-0}.${RUN_ATTEMPT}"
         DEPLOY_TITLE="${COMMIT_MSG} (${SHORT_SHA})"
         DEPLOY_DESCRIPTION="Build #${BUILD_NUMBER} | Commit: ${SHORT_SHA}"
-
         MAX_RETRIES=$((MAX_WAIT_MINUTES * 6))
 
-        echo "::notice::Triggering Dokploy deployment for app '${DOKPLOY_APP_ID}'."
-        echo "Deployment title: ${DEPLOY_TITLE}"
-        echo "Deployment description: ${DEPLOY_DESCRIPTION}"
+        # Record a timestamp just before triggering so compose can use it
+        # to identify the freshly-created deployment record.
+        TRIGGER_EPOCH=$(date -u +%s)
 
-        TRIGGER_PAYLOAD=$(
-          jq -cn \
-            --arg applicationId "$DOKPLOY_APP_ID" \
-            --arg title "$DEPLOY_TITLE" \
-            --arg description "$DEPLOY_DESCRIPTION" \
-            '{
-              applicationId: $applicationId,
-              title: $title,
-              description: $description
-            }'
-        )
+        # ──────────────────────────────────────────────
+        # Trigger
+        # ──────────────────────────────────────────────
 
-        api_request "POST" "/api/application.deploy" "$TRIGGER_PAYLOAD" "Triggering deployment" >/dev/null
+        if [ -n "$DOKPLOY_APP_ID" ]; then
+          # ── Application deployment ──────────────────
+          DEPLOY_TYPE="application"
+          DEPLOY_ID="$DOKPLOY_APP_ID"
+          echo "::notice::Triggering Dokploy application deployment for '$DOKPLOY_APP_ID'."
+          echo "Title      : ${DEPLOY_TITLE}"
+          echo "Description: ${DEPLOY_DESCRIPTION}"
 
-        echo "Dokploy accepted the deployment request. Monitoring for up to ${MAX_WAIT_MINUTES} minutes..."
+          TRIGGER_PAYLOAD=$(
+            jq -cn \
+              --arg applicationId "$DOKPLOY_APP_ID" \
+              --arg title         "$DEPLOY_TITLE" \
+              --arg description   "$DEPLOY_DESCRIPTION" \
+              '{applicationId: $applicationId, title: $title, description: $description}'
+          )
+          api_request "POST" "/api/application.deploy" "$TRIGGER_PAYLOAD" "Triggering application deployment" >/dev/null
+
+        else
+          # ── Compose deployment ──────────────────────
+          DEPLOY_TYPE="compose"
+          DEPLOY_ID="$DOKPLOY_COMPOSE_ID"
+          echo "::notice::Triggering Dokploy compose deployment for '$DOKPLOY_COMPOSE_ID'."
+
+          TRIGGER_PAYLOAD=$(
+            jq -cn \
+              --arg composeId "$DOKPLOY_COMPOSE_ID" \
+              '{composeId: $composeId}'
+          )
+          api_request "POST" "/api/compose.deploy" "$TRIGGER_PAYLOAD" "Triggering compose deployment" >/dev/null
+        fi
+
+        echo "Dokploy accepted the deployment request. Monitoring for up to ${MAX_WAIT_MINUTES} minute(s)..."
         sleep 10
+
+        # ──────────────────────────────────────────────
+        # Poll loop
+        # ──────────────────────────────────────────────
 
         COUNT=0
         while [ "$COUNT" -lt "$MAX_RETRIES" ]; do
-          RESPONSE=$(api_request "GET" "/api/application.one?applicationId=${DOKPLOY_APP_ID}" "" "Fetching application state")
 
-          DEPLOYMENT_ENTRY=$(
-            printf '%s' "$RESPONSE" | jq -c \
-              --arg TITLE "$DEPLOY_TITLE" \
-              --arg DESCRIPTION "$DEPLOY_DESCRIPTION" \
-              '
-                (.deployments // [])
-                | map(select(.title == $TITLE and ((.description // "") == $DESCRIPTION)))
-                | first // empty
-              '
-          )
+          # ── Fetch the deployment list ───────────────
+          if [ "$DEPLOY_TYPE" = "application" ]; then
+            RESPONSE=$(api_request "GET" "/api/deployment.all?applicationId=${DEPLOY_ID}" "" "Fetching application deployments")
 
+            # Match by title + description so re-runs on the same commit don't
+            # accidentally pick up an earlier (identically-named) record.
+            DEPLOYMENT_ENTRY=$(
+              printf '%s' "$RESPONSE" | jq -c \
+                --arg TITLE       "$DEPLOY_TITLE" \
+                --arg DESCRIPTION "$DEPLOY_DESCRIPTION" \
+                '
+                  (if type == "array" then . else .deployments // [] end)
+                  | map(select(.title == $TITLE and ((.description // "") == $DESCRIPTION)))
+                  | first // empty
+                '
+            )
+          else
+            RESPONSE=$(api_request "GET" "/api/deployment.allByCompose?composeId=${DEPLOY_ID}" "" "Fetching compose deployments")
+
+            # Compose deploy does not accept title/description, so match the
+            # record created at or after TRIGGER_EPOCH and take the most recent.
+            DEPLOYMENT_ENTRY=$(
+              printf '%s' "$RESPONSE" | jq -c \
+                --argjson EPOCH "$TRIGGER_EPOCH" \
+                '
+                  (if type == "array" then . else .deployments // [] end)
+                  | map(
+                      select(
+                        .createdAt != null and
+                        ((.createdAt | split(".")[0] | strptime("%Y-%m-%dT%H:%M:%S") | mktime) >= $EPOCH)
+                      )
+                    )
+                  | sort_by(.createdAt)
+                  | last // empty
+                '
+            )
+          fi
+
+          # ── Evaluate status ─────────────────────────
           if [ -z "$DEPLOYMENT_ENTRY" ]; then
-            echo "Status: waiting for Dokploy to create '${DEPLOY_TITLE}' with '${DEPLOY_DESCRIPTION}'."
+            echo "Status: waiting for Dokploy to register the new deployment record... ($((COUNT + 1))/${MAX_RETRIES})"
           else
             STATUS=$(printf '%s' "$DEPLOYMENT_ENTRY" | jq -r '.status // empty')
-            echo "Current status: ${STATUS:-unknown} ($((COUNT + 1))/${MAX_RETRIES})"
+            echo "Status: ${STATUS:-unknown} ($((COUNT + 1))/${MAX_RETRIES})"
 
             case "$STATUS" in
               done)
-                echo "::notice::Deployment completed successfully for ${SHORT_SHA}."
+                echo "::notice::✅ Deployment completed successfully for ${SHORT_SHA}."
                 exit 0
                 ;;
+
               error)
-                ERROR_MSG=$(extract_error_message "$DEPLOYMENT_ENTRY" "Dokploy marked the deployment as failed.")
-                echo "::error::Deployment failed for ${SHORT_SHA}: $ERROR_MSG"
+                LOG_PATH=$(printf '%s' "$DEPLOYMENT_ENTRY" | jq -r '.logPath // empty')
+                API_ERR=$(extract_error_message "$DEPLOYMENT_ENTRY" "Dokploy marked the deployment as failed.")
+                echo "::error::❌ Deployment failed for ${SHORT_SHA}"
+                echo "::error::   Status  : error"
+                echo "::error::   Detail  : $API_ERR"
+                if [ -n "$LOG_PATH" ]; then
+                  echo "::error::   Log path: $LOG_PATH"
+                fi
+                echo "::error::   Full record: $(printf '%s' "$DEPLOYMENT_ENTRY" | jq -c .)"
                 exit 1
                 ;;
+
               cancelled)
-                ERROR_MSG=$(extract_error_message "$DEPLOYMENT_ENTRY" "The deployment was cancelled in Dokploy.")
-                echo "::error::Deployment cancelled for ${SHORT_SHA}: $ERROR_MSG"
+                API_ERR=$(extract_error_message "$DEPLOYMENT_ENTRY" "The deployment was cancelled in Dokploy.")
+                echo "::error::❌ Deployment cancelled for ${SHORT_SHA}"
+                echo "::error::   Status : cancelled"
+                echo "::error::   Detail : $API_ERR"
+                echo "::error::   Full record: $(printf '%s' "$DEPLOYMENT_ENTRY" | jq -c .)"
                 exit 1
                 ;;
             esac
@@ -237,5 +338,6 @@ runs:
           sleep 10
         done
 
-        echo "::error::Deployment timed out after ${MAX_WAIT_MINUTES} minutes while waiting for '${DEPLOY_TITLE}'."
+        echo "::error::❌ Deployment timed out after ${MAX_WAIT_MINUTES} minute(s)."
+        echo "::error::   Last known status for deploy type '${DEPLOY_TYPE}' / ID '${DEPLOY_ID}' could not be confirmed as done."
         exit 1
