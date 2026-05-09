@@ -203,7 +203,7 @@ runs:
         fi
 
         echo "::notice::Triggering Dokploy ${DEPLOY_TYPE} deployment for '${DEPLOY_ID}'."
-        api_request "POST" "$TRIGGER_PATH" "$TRIGGER_PAYLOAD" "Triggering ${DEPLOY_TYPE} deployment" >/dev/null
+        TRIGGER_RESPONSE=$(api_request "POST" "$TRIGGER_PATH" "$TRIGGER_PAYLOAD" "Triggering ${DEPLOY_TYPE} deployment")
         echo "Dokploy accepted the request. Monitoring for up to ${MAX_WAIT_MINUTES} minute(s)..."
         sleep 10
 
